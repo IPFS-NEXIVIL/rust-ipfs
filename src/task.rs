@@ -5,7 +5,6 @@ use futures::{
         mpsc::{unbounded, Receiver, UnboundedSender},
         oneshot,
     },
-    sink::SinkExt,
     stream::Fuse,
     FutureExt, StreamExt,
 };
@@ -67,6 +66,7 @@ use libp2p::{
         KademliaEvent::*, PutRecordError, PutRecordOk, QueryId, QueryResult::*, Record,
     },
     mdns::Event as MdnsEvent,
+    rendezvous::{Cookie, Namespace},
     swarm::SwarmEvent,
 };
 
@@ -97,6 +97,11 @@ pub(crate) struct IpfsTask<C: NetworkBehaviour<ToSwarm = void::Void>> {
     pub(crate) local_listener: Vec<oneshot::Sender<Vec<Multiaddr>>>,
     pub(crate) timer: TaskTimer,
     pub(crate) local_external_addr: bool,
+    pub(crate) relay_listener: HashMap<PeerId, Vec<Channel<()>>>,
+    pub(crate) rzv_register_pending: HashMap<(PeerId, Namespace), Vec<Channel<()>>>,
+    pub(crate) rzv_discover_pending:
+        HashMap<(PeerId, Namespace), Vec<Channel<HashMap<PeerId, Vec<Multiaddr>>>>>,
+    pub(crate) rzv_cookie: HashMap<PeerId, Option<Cookie>>,
 }
 
 pub(crate) struct TaskTimer {
@@ -266,12 +271,8 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                     let addrs = self.swarm.external_addresses().cloned().collect::<Vec<_>>();
                     if !addrs.is_empty() {
                         for ch in self.external_listener.drain(..) {
-                            tokio::spawn({
-                                let addrs = addrs.clone();
-                                async move {
-                                    let _ = ch.send(addrs);
-                                }
-                            });
+                            let addrs = addrs.clone();
+                            let _ = ch.send(addrs);
                         }
                     }
                 }
@@ -279,12 +280,8 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                     let addrs = self.swarm.listeners().cloned().collect::<Vec<_>>();
                     if !addrs.is_empty() {
                         for ch in self.local_listener.drain(..) {
-                            tokio::spawn({
-                                let addrs = addrs.clone();
-                                async move {
-                                    let _ = ch.send(addrs);
-                                }
-                            });
+                            let addrs = addrs.clone();
+                            let _ = ch.send(addrs);
                         }
                     }
                 }
@@ -324,9 +321,7 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
         for ch in &self.pubsub_event_stream {
             let ch = ch.clone();
             let event = event.clone();
-            tokio::spawn(async move {
-                let _ = ch.unbounded_send(event);
-            });
+            let _ = ch.unbounded_send(event);
         }
     }
 
@@ -343,12 +338,8 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                     .insert(address.clone(), listener_id);
 
                 for ch in self.local_listener.drain(..) {
-                    tokio::spawn({
-                        let addr = address.clone();
-                        async move {
-                            let _ = ch.send(vec![addr]);
-                        }
-                    });
+                    let addr = address.clone();
+                    let _ = ch.send(vec![addr]);
                 }
 
                 if self.local_external_addr
@@ -369,11 +360,9 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 if let Some(ch) = self.disconnect_confirmation.remove(&peer_id) {
-                    tokio::spawn(async move {
-                        for ch in ch {
-                            let _ = ch.send(Ok(()));
-                        }
-                    });
+                    for ch in ch {
+                        let _ = ch.send(Ok(()));
+                    }
                 }
             }
             SwarmEvent::ExpiredListenAddr {
@@ -563,14 +552,9 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                                 }
                                 if let Entry::Occupied(entry) = self.provider_stream.entry(id) {
                                     if !providers.is_empty() {
-                                        tokio::spawn({
-                                            let mut tx = entry.get().clone();
-                                            async move {
-                                                for provider in providers {
-                                                    let _ = tx.send(provider).await;
-                                                }
-                                            }
-                                        });
+                                        for provider in providers {
+                                            let _ = entry.get().unbounded_send(provider);
+                                        }
                                     }
                                 }
                             }
@@ -636,12 +620,7 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                             }
                             GetRecord(Ok(GetRecordOk::FoundRecord(record))) => {
                                 if let Entry::Occupied(entry) = self.record_stream.entry(id) {
-                                    tokio::spawn({
-                                        let mut tx = entry.get().clone();
-                                        async move {
-                                            let _ = tx.send(record.record).await;
-                                        }
-                                    });
+                                    let _ = entry.get().unbounded_send(record.record);
                                 }
                             }
                             GetRecord(Ok(GetRecordOk::FinishedWithNoAdditionalRecord {
@@ -839,8 +818,8 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
             SwarmEvent::Behaviour(BehaviourEvent::Ping(event)) => match event {
                 libp2p::ping::Event {
                     peer,
+                    connection,
                     result: Result::Ok(rtt),
-                    ..
                 } => {
                     trace!(
                         "ping: rtt to {} is {} ms",
@@ -848,11 +827,62 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                         rtt.as_millis()
                     );
                     self.swarm.behaviour_mut().peerbook.set_peer_rtt(peer, rtt);
+                    if let Some(m) = self.swarm.behaviour_mut().relay_manager.as_mut() {
+                        m.set_peer_rtt(peer, connection, rtt)
+                    }
                 }
                 libp2p::ping::Event { .. } => {
                     //TODO: Determine if we should continue handling ping errors and if we should disconnect/close connection.
                 }
             },
+            SwarmEvent::Behaviour(BehaviourEvent::RelayClient(event)) => {
+                debug!("Relay Client Event: {event:?}");
+                if let Some(m) = self.swarm.behaviour_mut().relay_manager.as_mut() {
+                    m.process_relay_event(event);
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::RelayManager(event)) => {
+                debug!("Relay Manager Event: {event:?}");
+                match event {
+                    libp2p_relay_manager::Event::ReservationSuccessful { peer_id, .. } => {
+                        if let Some(chs) = self.relay_listener.remove(&peer_id) {
+                            for ch in chs {
+                                let _ = ch.send(Ok(()));
+                            }
+                        }
+                    }
+                    libp2p_relay_manager::Event::ReservationClosed { peer_id, result } => {
+                        if let Some(chs) = self.relay_listener.remove(&peer_id) {
+                            match result {
+                                Ok(()) => {
+                                    for ch in chs {
+                                        let _ = ch.send(Ok(()));
+                                    }
+                                }
+                                Err(e) => {
+                                    let e = e.to_string();
+                                    for ch in chs {
+                                        let _ = ch.send(Err(anyhow::anyhow!("{}", e.clone())));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    libp2p_relay_manager::Event::ReservationFailure {
+                        peer_id,
+                        result: err,
+                    } => {
+                        if let Some(chs) = self.relay_listener.remove(&peer_id) {
+                            let e = err.to_string();
+                            for ch in chs {
+                                let _ = ch.send(Err(anyhow::anyhow!("{}", e.clone())));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             SwarmEvent::Behaviour(BehaviourEvent::Identify(event)) => match event {
                 IdentifyEvent::Received { peer_id, info } => {
                     self.swarm
@@ -896,7 +926,7 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                         }
                     }
                 }
-                event => trace!("identify: {:?}", event),
+                event => debug!("identify: {:?}", event),
             },
             SwarmEvent::Behaviour(BehaviourEvent::Autonat(autonat::Event::StatusChanged {
                 old,
@@ -906,7 +936,105 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                 debug!("Old Nat Status: {:?}", old);
                 debug!("New Nat Status: {:?}", new);
             }
-            _ => trace!("Swarm event: {:?}", swarm_event),
+            SwarmEvent::Behaviour(BehaviourEvent::RendezvousClient(
+                libp2p::rendezvous::client::Event::Discovered {
+                    rendezvous_node,
+                    registrations,
+                    cookie,
+                },
+            )) => {
+                self.rzv_cookie.insert(rendezvous_node, Some(cookie));
+                let mut ns_list = HashSet::new();
+                let addrbook = &mut self.swarm.behaviour_mut().addressbook;
+                let mut ns_book: HashMap<Namespace, HashMap<PeerId, Vec<Multiaddr>>> =
+                    HashMap::new();
+                for registration in registrations {
+                    let namespace = registration.namespace.clone();
+                    let peer_id = registration.record.peer_id();
+                    let addrs = registration.record.addresses();
+                    for addr in addrs {
+                        if addrbook.add_address(peer_id, addr.clone()) {
+                            info!("Discovered {peer_id} with address {addr} in {namespace}");
+                        }
+                    }
+                    ns_book
+                        .entry(namespace.clone())
+                        .or_default()
+                        .entry(peer_id)
+                        .or_default()
+                        .extend(addrs.to_vec());
+                    ns_list.insert(namespace);
+                }
+
+                for ns in ns_list {
+                    let map = ns_book.remove(&ns).unwrap_or_default();
+                    if let Some(channels) = self.rzv_discover_pending.remove(&(rendezvous_node, ns))
+                    {
+                        for ch in channels {
+                            let _ = ch.send(Ok(map.clone()));
+                        }
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::RendezvousClient(
+                libp2p::rendezvous::client::Event::DiscoverFailed {
+                    rendezvous_node,
+                    namespace,
+                    error,
+                },
+            )) => {
+                let Some(ns) = namespace else {
+                    error!("Error registering to {rendezvous_node}: {error:?}");
+                    return;
+                };
+
+                error!("Error registering namespace {ns} to {rendezvous_node}: {error:?}");
+
+                if let Some(channels) = self.rzv_discover_pending.remove(&(rendezvous_node, ns)) {
+                    for ch in channels {
+                        let _ = ch.send(Err(anyhow::anyhow!(
+                            "Error discovering peers on {rendezvous_node}: {error:?}"
+                        )));
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::RendezvousClient(
+                libp2p::rendezvous::client::Event::Registered {
+                    rendezvous_node,
+                    ttl,
+                    namespace,
+                },
+            )) => {
+                info!("Registered to {rendezvous_node} under {namespace} for {ttl} secs");
+
+                if let Some(channels) = self
+                    .rzv_register_pending
+                    .remove(&(rendezvous_node, namespace.clone()))
+                {
+                    for ch in channels {
+                        let _ = ch.send(Ok(()));
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::RendezvousClient(
+                libp2p::rendezvous::client::Event::RegisterFailed {
+                    rendezvous_node,
+                    namespace,
+                    error,
+                },
+            )) => {
+                error!("Error registering namespace {namespace} to {rendezvous_node}: {error:?}");
+
+                if let Some(channels) = self
+                    .rzv_register_pending
+                    .remove(&(rendezvous_node, namespace.clone()))
+                {
+                    for ch in channels {
+                        let _ = ch.send(Err(anyhow::anyhow!("Error registering namespace {namespace} to {rendezvous_node}: {error:?}")));
+                    }
+                }
+            }
+            _ => debug!("Swarm event: {:?}", swarm_event),
         }
     }
 
@@ -1058,23 +1186,21 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                 }
             }
             IpfsEvent::Bootstrap(ret) => {
-                let future = match self
-                    .swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .as_mut()
-                    .map(|kad| kad.bootstrap())
-                {
-                    Some(Ok(id)) => {
+                let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() else {
+                    let _ = ret.send(Err(anyhow!("kad protocol is disabled")));
+                    return;
+                };
+
+                let future = match kad.bootstrap() {
+                    Ok(id) => {
                         let (tx, rx) = oneshot::channel();
                         self.kad_subscriptions.insert(id, tx);
                         Ok(rx)
                     }
-                    Some(Err(e)) => {
+                    Err(e) => {
                         error!("kad: can't bootstrap the node: {:?}", e);
                         Err(anyhow!("kad: can't bootstrap the node: {:?}", e))
                     }
-                    None => Err(anyhow!("kad protocol is disabled")),
                 };
                 let _ = ret.send(future);
             }
@@ -1106,23 +1232,17 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                 let _ = ret.send(result);
             }
             IpfsEvent::GetClosestPeers(peer_id, ret) => {
-                let id = self
-                    .swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .as_mut()
-                    .map(|kad| kad.get_closest_peers(peer_id));
+                let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() else {
+                    let _ = ret.send(Err(anyhow!("kad protocol is disabled")));
+                    return;
+                };
+
+                let id = kad.get_closest_peers(peer_id);
 
                 let (tx, rx) = oneshot::channel();
-                let _ = ret.send(rx);
-                match id {
-                    Some(id) => {
-                        self.kad_subscriptions.insert(id, tx);
-                    }
-                    None => {
-                        let _ = tx.send(Err(anyhow::anyhow!("kad protocol is disabled")));
-                    }
-                };
+
+                self.kad_subscriptions.insert(id, tx);
+                let _ = ret.send(Ok(rx));
             }
             IpfsEvent::WantList(peer, ret) => {
                 if let Some(bitswap) = self.swarm.behaviour().bitswap.as_ref() {
@@ -1165,17 +1285,18 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                         let _ = tx.send(Ok(info.clone()));
                     }
                     None => {
-                        self.swarm
-                            .behaviour_mut()
-                            .kademlia
-                            .as_mut()
-                            .map(|kad| kad.get_closest_peers(peer_id));
+                        let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() else {
+                            let _ = ret.send(Err(anyhow!("kad protocol is disabled")));
+                            return;
+                        };
+
+                        kad.get_closest_peers(peer_id);
 
                         self.dht_peer_lookup.entry(peer_id).or_default().push(tx);
                     }
                 }
 
-                let _ = ret.send(rx);
+                let _ = ret.send(Ok(rx));
             }
             IpfsEvent::FindPeer(peer_id, local_only, ret) => {
                 let listener_addrs = self
@@ -1203,22 +1324,21 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                 let addrs = if !locally_known_addrs.is_empty() || local_only {
                     Either::Left(locally_known_addrs)
                 } else {
+                    let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() else {
+                        let _ = ret.send(Err(anyhow!("kad protocol is disabled")));
+                        return;
+                    };
+
                     Either::Right({
-                        let id = self
-                            .swarm
-                            .behaviour_mut()
-                            .kademlia
-                            .as_mut()
-                            .map(|kad| kad.get_closest_peers(peer_id));
+                        let id = kad.get_closest_peers(peer_id);
 
                         let (tx, rx) = oneshot::channel();
-                        if let Some(id) = id {
-                            self.kad_subscriptions.insert(id, tx);
-                        }
+                        self.kad_subscriptions.insert(id, tx);
+
                         rx
                     })
                 };
-                let _ = ret.send(addrs);
+                let _ = ret.send(Ok(addrs));
             }
             IpfsEvent::WhitelistPeer(peer_id, ret) => {
                 self.swarm.behaviour_mut().peerbook.add(peer_id);
@@ -1229,72 +1349,65 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                 let _ = ret.send(Ok(()));
             }
             IpfsEvent::GetProviders(cid, ret) => {
-                let key = Key::from(cid.hash().to_bytes());
-                let id = self
-                    .swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .as_mut()
-                    .map(|kad| kad.get_providers(key));
+                let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() else {
+                    let _ = ret.send(Err(anyhow!("kad protocol is disabled")));
+                    return;
+                };
 
-                let mut provider_stream = None;
+                let key = Key::from(cid.hash().to_bytes());
+                let id = kad.get_providers(key);
 
                 let (tx, mut rx) = futures::channel::mpsc::unbounded();
-                if let Some(id) = id {
-                    let stream = async_stream::stream! {
-                        let mut current_providers: HashSet<PeerId> = Default::default();
-                        while let Some(provider) = rx.next().await {
-                            if current_providers.insert(provider) {
-                                yield provider;
-                            }
+                let stream = async_stream::stream! {
+                    let mut current_providers: HashSet<PeerId> = Default::default();
+                    while let Some(provider) = rx.next().await {
+                        if current_providers.insert(provider) {
+                            yield provider;
                         }
-                    };
-                    self.provider_stream.insert(id, tx);
-                    provider_stream = Some(stream.boxed());
-                }
+                    }
+                };
+                self.provider_stream.insert(id, tx);
 
-                let _ = ret.send(provider_stream);
+                let _ = ret.send(Ok(Some(stream.boxed())));
             }
             IpfsEvent::Provide(cid, ret) => {
+                let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() else {
+                    let _ = ret.send(Err(anyhow!("kad protocol is disabled")));
+                    return;
+                };
+
                 let key = Key::from(cid.hash().to_bytes());
-                let future = match self
-                    .swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .as_mut()
-                    .map(|kad| kad.start_providing(key))
-                {
-                    Some(Ok(id)) => {
+
+                let future = match kad.start_providing(key) {
+                    Ok(id) => {
                         let (tx, rx) = oneshot::channel();
                         self.kad_subscriptions.insert(id, tx);
                         Ok(rx)
                     }
-                    Some(Err(e)) => {
+                    Err(e) => {
                         error!("kad: can't provide a key: {:?}", e);
                         Err(anyhow!("kad: can't provide the key: {:?}", e))
                     }
-                    None => Err(anyhow!("kad protocol is disabled")),
                 };
                 let _ = ret.send(future);
             }
             IpfsEvent::DhtMode(mode, ret) => {
-                let res = match self.swarm.behaviour_mut().kademlia.as_mut() {
-                    Some(kad) => {
-                        kad.set_mode(mode.into());
-                        Ok(())
-                    }
-                    None => Err(anyhow!("kad protocol is disabled")),
+                let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() else {
+                    let _ = ret.send(Err(anyhow!("kad protocol is disabled")));
+                    return;
                 };
 
-                let _ = ret.send(res);
+                kad.set_mode(mode.into());
+
+                let _ = ret.send(Ok(()));
             }
             IpfsEvent::DhtGet(key, ret) => {
-                let id = self
-                    .swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .as_mut()
-                    .map(|kad| kad.get_record(key));
+                let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() else {
+                    let _ = ret.send(Err(anyhow!("kad protocol is disabled")));
+                    return;
+                };
+
+                let id = kad.get_record(key);
 
                 let (tx, mut rx) = futures::channel::mpsc::unbounded();
                 let stream = async_stream::stream! {
@@ -1302,37 +1415,35 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                             yield record;
                     }
                 };
-                if let Some(id) = id {
-                    self.record_stream.insert(id, tx);
-                }
+                self.record_stream.insert(id, tx);
 
-                let _ = ret.send(stream.boxed());
+                let _ = ret.send(Ok(stream.boxed()));
             }
             IpfsEvent::DhtPut(key, value, quorum, ret) => {
+                let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() else {
+                    let _ = ret.send(Err(anyhow!("kad protocol is disabled")));
+                    return;
+                };
+
                 let record = Record {
                     key,
                     value,
                     publisher: None,
                     expires: None,
                 };
-                let future = match self
-                    .swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .as_mut()
-                    .map(|kad| kad.put_record(record, quorum))
-                {
-                    Some(Ok(id)) => {
+
+                let future = match kad.put_record(record, quorum) {
+                    Ok(id) => {
                         let (tx, rx) = oneshot::channel();
                         self.kad_subscriptions.insert(id, tx);
                         Ok(rx)
                     }
-                    Some(Err(e)) => {
+                    Err(e) => {
                         error!("kad: can't put a record: {:?}", e);
                         Err(anyhow!("kad: can't provide the record: {:?}", e))
                     }
-                    None => Err(anyhow!("kad protocol is not enabled")),
                 };
+
                 let _ = ret.send(future);
             }
             IpfsEvent::GetBootstrappers(ret) => {
@@ -1340,106 +1451,221 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                 let _ = ret.send(list);
             }
             IpfsEvent::AddBootstrapper(mut addr, ret) => {
+                let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() else {
+                    let _ = ret.send(Err(anyhow!("kad protocol is disabled")));
+                    return;
+                };
+
                 let ret_addr = addr.clone();
-                if !self.swarm.behaviour().kademlia.is_enabled() {
-                    let _ = ret.send(Err(anyhow::anyhow!("kad protocol is disabled")));
-                } else {
-                    if self.bootstraps.insert(addr.clone()) {
-                        if let Some(peer_id) = addr.extract_peer_id() {
-                            self.swarm
-                                .behaviour_mut()
-                                .kademlia
-                                .as_mut()
-                                .map(|kad| kad.add_address(&peer_id, addr));
-                            self.swarm.behaviour_mut().peerbook.add(peer_id);
-                            // the return value of add_address doesn't implement Debug
-                            trace!(peer_id=%peer_id, "tried to add a bootstrapper");
-                        }
+
+                if self.bootstraps.insert(addr.clone()) {
+                    if let Some(peer_id) = addr.extract_peer_id() {
+                        kad.add_address(&peer_id, addr);
+                        // the return value of add_address doesn't implement Debug
+                        trace!(peer_id=%peer_id, "tried to add a bootstrapper");
                     }
-                    let _ = ret.send(Ok(ret_addr));
                 }
+                let _ = ret.send(Ok(ret_addr));
             }
             IpfsEvent::RemoveBootstrapper(mut addr, ret) => {
-                let result = addr.clone();
-                if !self.swarm.behaviour().kademlia.is_enabled() {
-                    let _ = ret.send(Err(anyhow::anyhow!("kad protocol is disabled")));
-                } else {
-                    if self.bootstraps.remove(&addr) {
-                        if let Some(peer_id) = addr.extract_peer_id() {
-                            let prefix: Multiaddr = addr;
+                let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() else {
+                    let _ = ret.send(Err(anyhow!("kad protocol is disabled")));
+                    return;
+                };
 
-                            if let Some(Some(e)) = self
-                                .swarm
-                                .behaviour_mut()
-                                .kademlia
-                                .as_mut()
-                                .map(|kad| kad.remove_address(&peer_id, &prefix))
-                            {
-                                info!(peer_id=%peer_id, status=?e.status, "removed bootstrapper");
-                            } else {
-                                warn!(peer_id=%peer_id, "attempted to remove an unknown bootstrapper");
-                            }
-                            self.swarm.behaviour_mut().peerbook.remove(peer_id);
+                let result = addr.clone();
+
+                if self.bootstraps.remove(&addr) {
+                    if let Some(peer_id) = addr.extract_peer_id() {
+                        let prefix: Multiaddr = addr;
+
+                        if let Some(e) = kad.remove_address(&peer_id, &prefix) {
+                            info!(peer_id=%peer_id, status=?e.status, "removed bootstrapper");
+                        } else {
+                            warn!(peer_id=%peer_id, "attempted to remove an unknown bootstrapper");
                         }
                     }
+
                     let _ = ret.send(Ok(result));
                 }
             }
             IpfsEvent::ClearBootstrappers(ret) => {
+                let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() else {
+                    let _ = ret.send(Err(anyhow!("kad protocol is disabled")));
+                    return;
+                };
+
                 let removed = self.bootstraps.drain().collect::<Vec<_>>();
                 let mut list = Vec::with_capacity(removed.len());
-                if self.swarm.behaviour().kademlia.is_enabled() {
-                    for mut addr_with_peer_id in removed {
-                        let priginal = addr_with_peer_id.clone();
-                        let Some(peer_id) = addr_with_peer_id.extract_peer_id() else {
-                            continue;
-                        };
-                        let prefix: Multiaddr = addr_with_peer_id;
 
-                        if let Some(Some(e)) = self
-                            .swarm
-                            .behaviour_mut()
-                            .kademlia
-                            .as_mut()
-                            .map(|kad| kad.remove_address(&peer_id, &prefix))
-                        {
-                            info!(peer_id=%peer_id, status=?e.status, "cleared bootstrapper");
-                            list.push(priginal);
-                        } else {
-                            error!(peer_id=%peer_id, "attempted to clear an unknown bootstrapper");
-                        }
-                        self.swarm.behaviour_mut().peerbook.remove(peer_id);
+                for mut addr_with_peer_id in removed {
+                    let priginal = addr_with_peer_id.clone();
+                    let Some(peer_id) = addr_with_peer_id.extract_peer_id() else {
+                        continue;
+                    };
+                    let prefix: Multiaddr = addr_with_peer_id;
+
+                    if let Some(e) = kad.remove_address(&peer_id, &prefix) {
+                        info!(peer_id=%peer_id, status=?e.status, "cleared bootstrapper");
+                        list.push(priginal);
+                    } else {
+                        error!(peer_id=%peer_id, "attempted to clear an unknown bootstrapper");
                     }
                 }
-                let _ = ret.send(list);
+
+                let _ = ret.send(Ok(list));
             }
             IpfsEvent::DefaultBootstrap(ret) => {
-                let mut rets = Vec::new();
-                if self.swarm.behaviour().kademlia.is_enabled() {
-                    for addr in BOOTSTRAP_NODES {
-                        let mut addr = addr
-                            .parse::<Multiaddr>()
-                            .expect("see test bootstrap_nodes_are_multiaddr_with_peerid");
-                        let original: Multiaddr = addr.clone();
-                        if self.bootstraps.insert(addr.clone()) {
-                            let Some(peer_id) = addr.extract_peer_id() else {
-                                continue;
-                            };
+                let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() else {
+                    let _ = ret.send(Err(anyhow!("kad protocol is disabled")));
+                    return;
+                };
 
-                            self.swarm
-                                .behaviour_mut()
-                                .kademlia
-                                .as_mut()
-                                .map(|kad| kad.add_address(&peer_id, addr.clone()));
-                            trace!(peer_id=%peer_id, "tried to restore a bootstrapper");
-                            self.swarm.behaviour_mut().peerbook.add(peer_id);
-                            // report with the peerid
-                            rets.push(original);
-                        }
+                let mut rets = Vec::new();
+                for addr in BOOTSTRAP_NODES {
+                    let mut addr = addr
+                        .parse::<Multiaddr>()
+                        .expect("see test bootstrap_nodes_are_multiaddr_with_peerid");
+                    let original: Multiaddr = addr.clone();
+                    if self.bootstraps.insert(addr.clone()) {
+                        let Some(peer_id) = addr.extract_peer_id() else {
+                            continue;
+                        };
+
+                        kad.add_address(&peer_id, addr.clone());
+
+                        trace!(peer_id=%peer_id, "tried to restore a bootstrapper");
+                        // report with the peerid
+                        rets.push(original);
                     }
                 }
 
                 let _ = ret.send(Ok(rets));
+            }
+            IpfsEvent::AddRelay(peer_id, addr, tx) => {
+                let Some(relay) = self.swarm.behaviour_mut().relay_manager.as_mut() else {
+                    let _ = tx.send(Err(anyhow::anyhow!("Relay is not enabled")));
+                    return;
+                };
+
+                relay.add_address(peer_id, addr);
+
+                let _ = tx.send(Ok(()));
+            }
+            IpfsEvent::RemoveRelay(peer_id, addr, tx) => {
+                let Some(relay) = self.swarm.behaviour_mut().relay_manager.as_mut() else {
+                    let _ = tx.send(Err(anyhow::anyhow!("Relay is not enabled")));
+                    return;
+                };
+
+                relay.remove_address(peer_id, addr);
+
+                let _ = tx.send(Ok(()));
+            }
+            IpfsEvent::EnableRelay(Some(peer_id), tx) => {
+                let Some(relay) = self.swarm.behaviour_mut().relay_manager.as_mut() else {
+                    let _ = tx.send(Err(anyhow::anyhow!("Relay is not enabled")));
+                    return;
+                };
+
+                relay.select(peer_id);
+
+                self.relay_listener.entry(peer_id).or_default().push(tx);
+            }
+            IpfsEvent::EnableRelay(None, tx) => {
+                let Some(relay) = self.swarm.behaviour_mut().relay_manager.as_mut() else {
+                    let _ = tx.send(Err(anyhow::anyhow!("Relay is not enabled")));
+                    return;
+                };
+
+                let Some(peer_id) = relay.random_select() else {
+                    let _ = tx.send(Err(anyhow::anyhow!(
+                        "No relay was selected or was unavailable"
+                    )));
+                    return;
+                };
+
+                self.relay_listener.entry(peer_id).or_default().push(tx);
+            }
+            IpfsEvent::DisableRelay(peer_id, tx) => {
+                let Some(relay) = self.swarm.behaviour_mut().relay_manager.as_mut() else {
+                    let _ = tx.send(Err(anyhow::anyhow!("Relay is not enabled")));
+                    return;
+                };
+                relay.disable_relay(peer_id);
+
+                let _ = tx.send(Ok(()));
+            }
+            IpfsEvent::ListRelays(tx) => {
+                let Some(relay) = self.swarm.behaviour().relay_manager.as_ref() else {
+                    let _ = tx.send(Err(anyhow::anyhow!("Relay is not enabled")));
+                    return;
+                };
+
+                let list = relay
+                    .list_relays()
+                    .map(|(peer_id, addrs)| (*peer_id, addrs.clone()))
+                    .collect();
+
+                let _ = tx.send(Ok(list));
+            }
+            IpfsEvent::ListActiveRelays(tx) => {
+                let Some(relay) = self.swarm.behaviour().relay_manager.as_ref() else {
+                    let _ = tx.send(Err(anyhow::anyhow!("Relay is not enabled")));
+                    return;
+                };
+
+                let list = relay.list_active_relays();
+
+                let _ = tx.send(Ok(list));
+            }
+            IpfsEvent::RegisterRendezvousNamespace(ns, peer_id, ttl, res) => {
+                let Some(rz) = self.swarm.behaviour_mut().rendezvous_client.as_mut() else {
+                    let _ = res.send(Err(anyhow::anyhow!("Rendezvous client is not enabled")));
+                    return;
+                };
+
+                if let Err(e) = rz.register(ns.clone(), peer_id, ttl) {
+                    let _ = res.send(Err(anyhow::Error::from(e)));
+                    return;
+                }
+                self.rzv_register_pending
+                    .entry((peer_id, ns))
+                    .or_default()
+                    .push(res);
+            }
+            IpfsEvent::UnregisterRendezvousNamespace(ns, peer_id, res) => {
+                let Some(rz) = self.swarm.behaviour_mut().rendezvous_client.as_mut() else {
+                    let _ = res.send(Err(anyhow::anyhow!("Rendezvous client is not enabled")));
+                    return;
+                };
+
+                rz.unregister(ns.clone(), peer_id);
+
+                let _ = res.send(Ok(()));
+            }
+            IpfsEvent::RendezvousNamespaceDiscovery(ns, use_cookie, ttl, peer_id, res) => {
+                let Some(rz) = self.swarm.behaviour_mut().rendezvous_client.as_mut() else {
+                    let _ = res.send(Err(anyhow::anyhow!("Rendezvous client is not enabled")));
+                    return;
+                };
+
+                let cookie = use_cookie
+                    .then_some(self.rzv_cookie.get(&peer_id).cloned().flatten())
+                    .flatten();
+
+                rz.discover(ns.clone(), cookie, ttl, peer_id);
+
+                match ns {
+                    Some(ns) => self
+                        .rzv_discover_pending
+                        .entry((peer_id, ns))
+                        .or_default()
+                        .push(res),
+                    None => {
+                        let _ = res.send(Ok(HashMap::new()));
+                    }
+                }
             }
             IpfsEvent::Exit => {
                 // FIXME: we could do a proper teardown

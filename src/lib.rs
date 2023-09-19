@@ -109,6 +109,7 @@ use libp2p::{
     core::{muxing::StreamMuxerBox, transport::Boxed},
     kad::{store::MemoryStoreConfig, KademliaConfig, Mode, Record},
     ping::Config as PingConfig,
+    rendezvous::Namespace,
     swarm::dial_opts::DialOpts,
     StreamProtocol,
 };
@@ -170,9 +171,6 @@ pub struct IpfsOptions {
     /// Enables ipv6 for mdns
     pub mdns_ipv6: bool,
 
-    /// Keep connection alive
-    pub keep_alive: bool,
-
     /// Enables dcutr
     pub dcutr: bool,
 
@@ -227,8 +225,18 @@ pub struct IpfsOptions {
 
     pub keystore: Keystore,
 
+    /// Connection idle
+    pub connection_idle: Duration,
+
     /// Repo Provider option
     pub provider: RepoProvider,
+
+    /// Rendezvous Client
+    pub rendezvous_client: bool,
+
+    /// Rendezvous Server
+    pub rendezvous_server: bool,
+
     /// The span for tracing purposes, `None` value is converted to `tracing::trace_span!("ipfs")`.
     ///
     /// All futures returned by `Ipfs`, background task actions and swarm actions are instrumented
@@ -265,7 +273,6 @@ impl Default for IpfsOptions {
             disable_kad: Default::default(),
             disable_bitswap: Default::default(),
             bitswap_config: Default::default(),
-            keep_alive: Default::default(),
             relay_server: Default::default(),
             relay_server_config: Default::default(),
             kad_configuration: Default::default(),
@@ -275,12 +282,15 @@ impl Default for IpfsOptions {
             addr_config: Default::default(),
             provider: Default::default(),
             keystore: Keystore::in_memory(),
+            connection_idle: Duration::from_secs(30),
             listening_addrs: vec![],
             port_mapping: false,
             transport_configuration: None,
             pubsub_config: None,
             swarm_configuration: None,
             span: None,
+            rendezvous_client: false,
+            rendezvous_server: false,
         }
     }
 }
@@ -389,31 +399,44 @@ enum IpfsEvent {
     Bootstrap(Channel<ReceiverChannel<KadResult>>),
     AddPeer(PeerId, Multiaddr, Channel<()>),
     RemovePeer(PeerId, Option<Multiaddr>, Channel<bool>),
-    GetClosestPeers(PeerId, OneshotSender<ReceiverChannel<KadResult>>),
-    FindPeerIdentity(
-        PeerId,
-        OneshotSender<ReceiverChannel<libp2p::identify::Info>>,
-    ),
+    GetClosestPeers(PeerId, Channel<ReceiverChannel<KadResult>>),
+    FindPeerIdentity(PeerId, Channel<ReceiverChannel<libp2p::identify::Info>>),
     FindPeer(
         PeerId,
         bool,
-        OneshotSender<Either<Vec<Multiaddr>, ReceiverChannel<KadResult>>>,
+        Channel<Either<Vec<Multiaddr>, ReceiverChannel<KadResult>>>,
     ),
     WhitelistPeer(PeerId, Channel<()>),
     RemoveWhitelistPeer(PeerId, Channel<()>),
-    GetProviders(Cid, OneshotSender<Option<BoxStream<'static, PeerId>>>),
+    GetProviders(Cid, Channel<Option<BoxStream<'static, PeerId>>>),
     Provide(Cid, Channel<ReceiverChannel<KadResult>>),
     DhtMode(DhtMode, Channel<()>),
-    DhtGet(Key, OneshotSender<BoxStream<'static, Record>>),
+    DhtGet(Key, Channel<BoxStream<'static, Record>>),
     DhtPut(Key, Vec<u8>, Quorum, Channel<ReceiverChannel<KadResult>>),
     GetBootstrappers(OneshotSender<Vec<Multiaddr>>),
     AddBootstrapper(Multiaddr, Channel<Multiaddr>),
     RemoveBootstrapper(Multiaddr, Channel<Multiaddr>),
-    ClearBootstrappers(OneshotSender<Vec<Multiaddr>>),
+    ClearBootstrappers(Channel<Vec<Multiaddr>>),
     DefaultBootstrap(Channel<Vec<Multiaddr>>),
 
+    AddRelay(PeerId, Multiaddr, Channel<()>),
+    RemoveRelay(PeerId, Multiaddr, Channel<()>),
+    EnableRelay(Option<PeerId>, Channel<()>),
+    DisableRelay(PeerId, Channel<()>),
+    ListRelays(Channel<Vec<(PeerId, Vec<Multiaddr>)>>),
+    ListActiveRelays(Channel<Vec<(PeerId, Vec<Multiaddr>)>>),
     //event streams
     PubsubEventStream(OneshotSender<UnboundedReceiver<InnerPubsubEvent>>),
+
+    RegisterRendezvousNamespace(Namespace, PeerId, Option<u64>, Channel<()>),
+    UnregisterRendezvousNamespace(Namespace, PeerId, Channel<()>),
+    RendezvousNamespaceDiscovery(
+        Option<Namespace>,
+        bool,
+        Option<u64>,
+        PeerId,
+        Channel<HashMap<PeerId, Vec<Multiaddr>>>,
+    ),
 
     Exit,
 }
@@ -598,6 +621,16 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
         self
     }
 
+    /// Set timeout for idle connections
+    pub fn set_idle_connection_timeout(mut self, duration: u64) -> Self {
+        let duration = match duration > 0 {
+            true => duration,
+            false => 30,
+        };
+        self.options.connection_idle = Duration::from_secs(duration);
+        self
+    }
+
     /// Set swarm configuration
     pub fn set_swarm_configuration(mut self, config: crate::p2p::SwarmConfig) -> Self {
         self.options.swarm_configuration = Some(config);
@@ -668,9 +701,9 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
     }
 
     /// Enable keep alive
-    pub fn enable_keepalive(mut self) -> Self {
-        self.options.keep_alive = true;
-        self
+    #[deprecated(note = "use UninitializedIpfs::set_idle_connection(u64::MAX / 2)")]
+    pub fn enable_keepalive(self) -> Self {
+        self.set_idle_connection_timeout(u64::MAX / 2)
     }
 
     /// Disables kademlia
@@ -726,6 +759,16 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
     /// Automatically add any listened address as an external address
     pub fn listen_as_external_addr(mut self) -> Self {
         self.local_external_addr = true;
+        self
+    }
+
+    pub fn enable_rendezvous_server(mut self) -> Self {
+        self.options.rendezvous_server = true;
+        self
+    }
+
+    pub fn enable_rendezvous_client(mut self) -> Self {
+        self.options.rendezvous_client = true;
         self
     }
 
@@ -940,7 +983,11 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
             external_listener: Default::default(),
             local_listener: Default::default(),
             timer: Default::default(),
+            relay_listener: Default::default(),
             local_external_addr,
+            rzv_register_pending: Default::default(),
+            rzv_discover_pending: Default::default(),
+            rzv_cookie: Default::default(),
         };
 
         for addr in listening_addrs.into_iter() {
@@ -1445,7 +1492,7 @@ impl Ipfs {
                         .send(IpfsEvent::FindPeerIdentity(peer_id, tx))
                         .await?;
 
-                    rx.await?.await?.map(PeerInfo::from)
+                    rx.await??.await?.map(PeerInfo::from)
                 }
                 None => {
                     let (local_result, external_result) =
@@ -1755,7 +1802,7 @@ impl Ipfs {
                 .send(IpfsEvent::FindPeer(peer_id, false, tx))
                 .await?;
 
-            match rx.await? {
+            match rx.await?? {
                 Either::Left(addrs) if !addrs.is_empty() => Ok(addrs),
                 Either::Left(_) => unreachable!(),
                 Either::Right(future) => {
@@ -1768,7 +1815,7 @@ impl Ipfs {
                         .send(IpfsEvent::FindPeer(peer_id, true, tx))
                         .await?;
 
-                    match rx.await? {
+                    match rx.await?? {
                         Either::Left(addrs) if !addrs.is_empty() => Ok(addrs),
                         _ => Err(anyhow!("couldn't find peer {}", peer_id)),
                     }
@@ -1791,7 +1838,7 @@ impl Ipfs {
                 .send(IpfsEvent::GetProviders(cid, tx))
                 .await?;
 
-            rx.await?.ok_or_else(|| anyhow!("Provider already exist"))
+            rx.await??.ok_or_else(|| anyhow!("Provider already exist"))
         }
         .instrument(self.span.clone())
         .await
@@ -1843,7 +1890,7 @@ impl Ipfs {
                 .send(IpfsEvent::GetClosestPeers(peer_id, tx))
                 .await?;
 
-            Ok(rx.await?).map_err(|e: String| anyhow!(e))
+            Ok(rx.await??).map_err(|e: String| anyhow!(e))
         }
         .instrument(self.span.clone())
         .await?
@@ -1900,7 +1947,7 @@ impl Ipfs {
                 .send(IpfsEvent::DhtGet(key, tx))
                 .await?;
 
-            Ok(rx.await?).map_err(|e: String| anyhow!(e))
+            rx.await?
         }
         .instrument(self.span.clone())
         .await
@@ -1950,34 +1997,172 @@ impl Ipfs {
         }
     }
 
-    // TBD
-    pub async fn add_relay(&self, _: Multiaddr) -> Result<(), Error> {
+    /// Add relay address
+    pub async fn add_relay(&self, peer_id: PeerId, addr: Multiaddr) -> Result<(), Error> {
+        async move {
+            let (tx, rx) = oneshot_channel();
+
+            self.to_task
+                .clone()
+                .send(IpfsEvent::AddRelay(peer_id, addr, tx))
+                .await?;
+
+            rx.await?
+        }
+        .instrument(self.span.clone())
+        .await
+    }
+
+    /// Remove relay address
+    pub async fn remove_relay(&self, peer_id: PeerId, addr: Multiaddr) -> Result<(), Error> {
+        async move {
+            let (tx, rx) = oneshot_channel();
+
+            self.to_task
+                .clone()
+                .send(IpfsEvent::RemoveRelay(peer_id, addr, tx))
+                .await?;
+
+            rx.await?
+        }
+        .instrument(self.span.clone())
+        .await
+    }
+
+    /// List all relays. if `active` is true, it will list all active relays
+    pub async fn list_relays(&self, active: bool) -> Result<Vec<(PeerId, Vec<Multiaddr>)>, Error> {
+        async move {
+            let (tx, rx) = oneshot_channel();
+
+            match active {
+                true => {
+                    self.to_task
+                        .clone()
+                        .send(IpfsEvent::ListActiveRelays(tx))
+                        .await?
+                }
+                false => self.to_task.clone().send(IpfsEvent::ListRelays(tx)).await?,
+            };
+
+            rx.await?
+        }
+        .instrument(self.span.clone())
+        .await
+    }
+
+    pub async fn enable_autorelay(&self) -> Result<(), Error> {
         Err(anyhow::anyhow!("Unimplemented"))
     }
 
-    // TBD
-    pub async fn remove_relay(&self, _: Vec<Multiaddr>) -> Result<(), Error> {
+    pub async fn disable_autorelay(&self) -> Result<(), Error> {
         Err(anyhow::anyhow!("Unimplemented"))
     }
 
-    // TBD
-    pub async fn default_relay(&self) -> Result<(), Error> {
-        Err(anyhow::anyhow!("Unimplemented"))
+    /// Enable use of a relay. If `peer_id` is `None`, it will select a relay at random to use, if one have been added
+    pub async fn enable_relay(&self, peer_id: Option<PeerId>) -> Result<(), Error> {
+        async move {
+            let (tx, rx) = oneshot_channel();
+
+            self.to_task
+                .clone()
+                .send(IpfsEvent::EnableRelay(peer_id, tx))
+                .await?;
+
+            rx.await?
+        }
+        .instrument(self.span.clone())
+        .await
     }
 
-    // TBD
-    pub async fn relay_status(&self, _: Option<PeerId>) -> Result<(), Error> {
-        Err(anyhow::anyhow!("Unimplemented"))
+    /// Disable the use of a selected relay.
+    pub async fn disable_relay(&self, peer_id: PeerId) -> Result<(), Error> {
+        async move {
+            let (tx, rx) = oneshot_channel();
+
+            self.to_task
+                .clone()
+                .send(IpfsEvent::DisableRelay(peer_id, tx))
+                .await?;
+
+            rx.await?
+        }
+        .instrument(self.span.clone())
+        .await
     }
 
-    // TBD
-    pub async fn set_relay(&self, _: Multiaddr) -> Result<(), Error> {
-        Err(anyhow::anyhow!("Unimplemented"))
+    pub async fn rendezvous_register_namespace<S: Into<String>>(
+        &self,
+        namespace: S,
+        ttl: Option<u64>,
+        peer_id: PeerId,
+    ) -> Result<(), Error> {
+        async move {
+            let namespace = Namespace::new(namespace.into())?;
+
+            let (tx, rx) = oneshot_channel();
+
+            self.to_task
+                .clone()
+                .send(IpfsEvent::RegisterRendezvousNamespace(
+                    namespace, peer_id, ttl, tx,
+                ))
+                .await?;
+
+            rx.await?
+        }
+        .instrument(self.span.clone())
+        .await
     }
 
-    // TBD
-    pub async fn auto_relay(&self) -> Result<(), Error> {
-        Err(anyhow::anyhow!("Unimplemented"))
+    pub async fn rendezvous_unregister_namespace<S: Into<String>>(
+        &self,
+        namespace: S,
+        peer_id: PeerId,
+    ) -> Result<(), Error> {
+        async move {
+            let namespace = Namespace::new(namespace.into())?;
+
+            let (tx, rx) = oneshot_channel();
+
+            self.to_task
+                .clone()
+                .send(IpfsEvent::UnregisterRendezvousNamespace(
+                    namespace, peer_id, tx,
+                ))
+                .await?;
+
+            rx.await?
+        }
+        .instrument(self.span.clone())
+        .await
+    }
+
+    pub async fn rendezvous_namespace_discovery<S: Into<String>>(
+        &self,
+        namespace: S,
+        ttl: Option<u64>,
+        peer_id: PeerId,
+    ) -> Result<HashMap<PeerId, Vec<Multiaddr>>, Error> {
+        async move {
+            let namespace = Namespace::new(namespace.into())?;
+
+            let (tx, rx) = oneshot_channel();
+
+            self.to_task
+                .clone()
+                .send(IpfsEvent::RendezvousNamespaceDiscovery(
+                    Some(namespace),
+                    false,
+                    ttl,
+                    peer_id,
+                    tx,
+                ))
+                .await?;
+
+            rx.await?
+        }
+        .instrument(self.span.clone())
+        .await
     }
 
     /// Walk the given Iplds' links up to `max_depth` (or indefinitely for `None`). Will return
@@ -2058,7 +2243,7 @@ impl Ipfs {
                 .send(IpfsEvent::ClearBootstrappers(tx))
                 .await?;
 
-            Ok(rx.await?)
+            rx.await?
         }
         .instrument(self.span.clone())
         .await

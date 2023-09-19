@@ -1,5 +1,5 @@
 use super::gossipsub::GossipsubStream;
-use super::{addressbook, protocol};
+use super::{addressbook, connection_idle, protocol};
 use bytes::Bytes;
 use libp2p_allow_block_list::BlockedPeers;
 
@@ -29,7 +29,6 @@ use libp2p::relay::client::Behaviour as RelayClient;
 use libp2p::relay::client::{self, Transport as ClientTransport};
 use libp2p::relay::Behaviour as Relay;
 use libp2p::swarm::behaviour::toggle::Toggle;
-use libp2p::swarm::keep_alive::Behaviour as KeepAliveBehaviour;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{autonat, StreamProtocol};
 use std::borrow::Cow;
@@ -49,15 +48,18 @@ where
     pub kademlia: Toggle<Kademlia<MemoryStore>>,
     pub ping: Ping,
     pub identify: Identify,
-    pub keepalive: Toggle<KeepAliveBehaviour>,
     pub pubsub: GossipsubStream,
     pub autonat: autonat::Behaviour,
     pub upnp: Toggle<libp2p_nat::Behaviour>,
     pub block_list: libp2p_allow_block_list::Behaviour<BlockedPeers>,
     pub relay: Toggle<Relay>,
     pub relay_client: Toggle<RelayClient>,
+    pub relay_manager: Toggle<libp2p_relay_manager::Behaviour>,
+    pub rendezvous_client: Toggle<libp2p::rendezvous::client::Behaviour>,
+    pub rendezvous_server: Toggle<libp2p::rendezvous::server::Behaviour>,
     pub dcutr: Toggle<Dcutr>,
     pub addressbook: addressbook::Behaviour,
+    pub connection_idle: connection_idle::Behaviour,
     pub peerbook: peerbook::Behaviour,
     pub protocol: protocol::Behaviour,
     pub custom: Toggle<C>,
@@ -388,8 +390,6 @@ where
             .then_some(Bitswap::new(peer_id, repo, Default::default()).await)
             .into();
 
-        let keepalive = options.keep_alive.then(KeepAliveBehaviour::default).into();
-
         let ping = Ping::new(options.ping_config.unwrap_or_default());
 
         let identify = Identify::new(
@@ -445,12 +445,13 @@ where
                 .then_some(libp2p_nat::Behaviour::default()),
         );
 
-        let (transport, relay_client) = match options.relay {
+        let (transport, relay_client, relay_manager) = match options.relay {
             true => {
                 let (transport, client) = client::new(peer_id);
-                (Some(transport), Some(client).into())
+                let manager = libp2p_relay_manager::Behaviour::new(Default::default());
+                (Some(transport), Some(client).into(), Some(manager).into())
             }
-            false => (None, None.into()),
+            false => (None, None.into(), None.into()),
         };
 
         let mut peerbook = peerbook::Behaviour::default();
@@ -461,14 +462,25 @@ where
 
         let block_list = libp2p_allow_block_list::Behaviour::default();
         let protocol = protocol::Behaviour::default();
+        let connection_idle = connection_idle::Behaviour::new(options.connection_idle);
         let custom = Toggle::from(custom);
 
+        let rendezvous_client = options
+            .rendezvous_client
+            .then_some(libp2p::rendezvous::client::Behaviour::new(keypair.clone()))
+            .into();
+
+        let rendezvous_server = options
+            .rendezvous_server
+            .then_some(libp2p::rendezvous::server::Behaviour::new(
+                Default::default(),
+            ))
+            .into();
         Ok((
             Behaviour {
                 mdns,
                 kademlia,
                 bitswap,
-                keepalive,
                 ping,
                 identify,
                 autonat,
@@ -476,12 +488,16 @@ where
                 dcutr,
                 relay,
                 relay_client,
+                relay_manager,
                 block_list,
                 upnp,
                 peerbook,
                 addressbook,
                 protocol,
                 custom,
+                connection_idle,
+                rendezvous_client,
+                rendezvous_server,
             },
             transport,
         ))
