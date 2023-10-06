@@ -1264,7 +1264,7 @@ impl Ipfs {
         unixfs::TraversalFailed,
     > {
         self.unixfs()
-            .cat(starting_point, range, &[], false)
+            .cat(starting_point, range, &[], false, None)
             .instrument(self.span.clone())
             .await
     }
@@ -1305,7 +1305,7 @@ impl Ipfs {
         dest: P,
     ) -> Result<BoxStream<'_, UnixfsStatus>, Error> {
         self.unixfs()
-            .get(path, dest, &[], false)
+            .get(path, dest, &[], false, None)
             .instrument(self.span.clone())
             .await
     }
@@ -1313,7 +1313,7 @@ impl Ipfs {
     /// List directory contents
     pub async fn ls_unixfs(&self, path: IpfsPath) -> Result<BoxStream<'_, NodeItem>, Error> {
         self.unixfs()
-            .ls(path, &[], false)
+            .ls(path, &[], false, None)
             .instrument(self.span.clone())
             .await
     }
@@ -1322,7 +1322,7 @@ impl Ipfs {
     pub async fn resolve_ipns(&self, path: &IpfsPath, recursive: bool) -> Result<IpfsPath, Error> {
         async move {
             let ipns = self.ipns();
-            let mut resolved = ipns.resolve(p2p::DnsResolver::Cloudflare, path).await;
+            let mut resolved = ipns.resolve(path).await;
 
             if recursive {
                 let mut seen = HashSet::with_capacity(1);
@@ -1330,7 +1330,7 @@ impl Ipfs {
                     if !seen.insert(res.clone()) {
                         break;
                     }
-                    resolved = ipns.resolve(p2p::DnsResolver::Cloudflare, res).await;
+                    resolved = ipns.resolve(res).await;
                 }
             }
             resolved
@@ -1340,7 +1340,6 @@ impl Ipfs {
     }
 
     /// Publish ipns record to DHT
-    #[cfg(feature = "experimental")]
     pub async fn publish_ipns(&self, path: &IpfsPath) -> Result<IpfsPath, Error> {
         async move {
             let ipns = self.ipns();

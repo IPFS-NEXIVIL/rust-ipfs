@@ -1,3 +1,22 @@
+# 0.5.0 [unreleased]
+- feat: Implement timeout while resolving blocks [PR XXX]
+
+[PR XXX]: https://github.com/dariusc93/rust-ipfs/pull/XXX
+
+# 0.4.6
+- chore: Updated libp2p-relay-manager
+
+# 0.4.5
+- chore: Add json and cbor feature
+
+# 0.4.4
+- chore: Use new method over deprecated and internal behaviours [PR 104]
+- fix: Set dns resolver as a field, and fix resolved path [PR 103]
+- chore: Remove experimental feature flag
+
+[PR 104]: https://github.com/dariusc93/rust-ipfs/pull/104
+[PR 103]: https://github.com/dariusc93/rust-ipfs/pull/103
+
 # 0.4.3
 - feat: Implement rendezvous protocol [PR 101]
 - chore: Cleanup future task [PR 102]
